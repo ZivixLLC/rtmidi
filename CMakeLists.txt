@@ -161,10 +161,18 @@ if (DEFINED RTMIDI_BUILD_SHARED_LIBS AND NOT RTMIDI_BUILD_SHARED_LIBS STREQUAL "
     add_library(rtmidi SHARED ${rtmidi_SOURCES})
   else()
     add_library(rtmidi STATIC ${rtmidi_SOURCES})
+    if(MSVC)
+		set_property(TARGET rtmidi PROPERTY
+			MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
+	endif()
   endif()
 elseif (DEFINED RTMIDI_BUILD_STATIC_LIBS AND NOT RTMIDI_BUILD_STATIC_LIBS STREQUAL "")
   if (RTMIDI_BUILD_STATIC_LIBS)
     add_library(rtmidi STATIC ${rtmidi_SOURCES})
+    if(MSVC)
+		set_property(TARGET rtmidi PROPERTY
+			MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
+	endif()
   else()
     add_library(rtmidi SHARED ${rtmidi_SOURCES})
   endif()
