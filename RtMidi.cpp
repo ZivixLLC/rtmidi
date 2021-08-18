@@ -40,7 +40,7 @@
 #include "RtMidi.h"
 #include <sstream>
 
-#if defined(TARGET_OS_IPHONE)
+#if (TARGET_OS_IPHONE == 1)
 
     #define AudioGetCurrentHostTime CAHostTimeBase::GetCurrentTime
     #define AudioConvertHostTimeToNanos CAHostTimeBase::ConvertToNanos
@@ -98,6 +98,7 @@ class MidiInCore: public MidiInApi
   std::string getPortName( unsigned int portNumber );
 
  protected:
+  MIDIClientRef getCoreMidiClientSingleton(const std::string& clientName) throw();
   void initialize( const std::string& clientName );
 };
 
@@ -117,6 +118,7 @@ class MidiOutCore: public MidiOutApi
   void sendMessage( const unsigned char *message, size_t size );
 
  protected:
+  MIDIClientRef getCoreMidiClientSingleton(const std::string& clientName) throw();
   void initialize( const std::string& clientName );
 };
 
@@ -305,9 +307,9 @@ RtMidi :: ~RtMidi()
   rtapi_ = 0;
 }
 
-RtMidi::RtMidi(RtMidi&& other) RTMIDI_NOEXCEPT { 
-    rtapi_ = other.rtapi_; 
-    other.rtapi_ = nullptr; 
+RtMidi::RtMidi(RtMidi&& other) noexcept {
+    rtapi_ = other.rtapi_;
+    other.rtapi_ = nullptr;
 }
 
 std::string RtMidi :: getVersion( void ) throw()
@@ -369,14 +371,14 @@ void RtMidi :: getCompiledApi( std::vector<RtMidi::Api> &apis ) throw()
 
 std::string RtMidi :: getApiName( RtMidi::Api api )
 {
-  if (api < 0 || api >= RtMidi::NUM_APIS)
+  if (api < RtMidi::UNSPECIFIED || api >= RtMidi::NUM_APIS)
     return "";
   return rtmidi_api_names[api][0];
 }
 
 std::string RtMidi :: getApiDisplayName( RtMidi::Api api )
 {
-  if (api < 0 || api >= RtMidi::NUM_APIS)
+  if (api < RtMidi::UNSPECIFIED || api >= RtMidi::NUM_APIS)
     return "Unknown";
   return rtmidi_api_names[api][1];
 }
@@ -741,10 +743,9 @@ MidiOutApi :: ~MidiOutApi( void )
 // MIDI input.  We convert the system specific time stamps to delta
 // time values.
 
-// OS-X CoreMIDI header files.
-#include <CoreMIDI/CoreMIDI.h>
+// OS-X CoreMIDI header files. (<CoreMIDI/CoreMIDI.h> moved to RtMidi.h)
 
-// these are not available on iOS. 
+// these are not available on iOS.
 #if (TARGET_OS_IPHONE == 0)
   #include <CoreAudio/HostTime.h>
   #include <CoreServices/CoreServices.h>
@@ -760,6 +761,21 @@ struct CoreMidiData {
   unsigned long long lastTime;
   MIDISysexSendRequest sysexreq;
 };
+
+
+static MIDIClientRef CoreMidiClientSingleton = 0;
+
+void RtMidi_setCoreMidiClientSingleton(MIDIClientRef client){
+  CoreMidiClientSingleton = client;
+}
+
+void RtMidi_disposeCoreMidiClientSingleton(){
+  if (CoreMidiClientSingleton == 0){
+    return;
+  }
+  MIDIClientDispose( CoreMidiClientSingleton );
+  CoreMidiClientSingleton = 0;
+}
 
 //*********************************************************************//
 //  API: OS-X
@@ -928,24 +944,37 @@ MidiInCore :: ~MidiInCore( void )
 
   // Cleanup.
   CoreMidiData *data = static_cast<CoreMidiData *> (apiData_);
-  MIDIClientDispose( data->client );
   if ( data->endpoint ) MIDIEndpointDispose( data->endpoint );
   delete data;
+}
+
+MIDIClientRef MidiInCore::getCoreMidiClientSingleton(const std::string& clientName) throw() {
+
+  if (CoreMidiClientSingleton == 0){
+      // Set up our client.
+      MIDIClientRef client;
+
+      CFStringRef name = CFStringCreateWithCString( NULL, clientName.c_str(), kCFStringEncodingASCII );
+      OSStatus result = MIDIClientCreate(name, NULL, NULL, &client );
+      if ( result != noErr ) {
+        std::ostringstream ost;
+        ost << "MidiInCore::initialize: error creating OS-X MIDI client object (" << result << ").";
+        errorString_ = ost.str();
+        error( RtMidiError::DRIVER_ERROR, errorString_ );
+        return 0;
+      }
+      CFRelease( name );
+
+      CoreMidiClientSingleton = client;
+  }
+
+  return CoreMidiClientSingleton;
 }
 
 void MidiInCore :: initialize( const std::string& clientName )
 {
   // Set up our client.
-  MIDIClientRef client;
-  CFStringRef name = CFStringCreateWithCString( NULL, clientName.c_str(), kCFStringEncodingASCII );
-  OSStatus result = MIDIClientCreate(name, NULL, NULL, &client );
-  if ( result != noErr ) {
-    std::ostringstream ost;
-    ost << "MidiInCore::initialize: error creating OS-X MIDI client object (" << result << ").";
-    errorString_ = ost.str();
-    error( RtMidiError::DRIVER_ERROR, errorString_ );
-    return;
-  }
+  MIDIClientRef client = getCoreMidiClientSingleton(clientName);
 
   // Save our api-specific connection information.
   CoreMidiData *data = (CoreMidiData *) new CoreMidiData;
@@ -953,7 +982,6 @@ void MidiInCore :: initialize( const std::string& clientName )
   data->endpoint = 0;
   apiData_ = (void *) data;
   inputData_.apiData = (void *) data;
-  CFRelease( name );
 }
 
 void MidiInCore :: openPort( unsigned int portNumber, const std::string &portName )
@@ -989,7 +1017,6 @@ void MidiInCore :: openPort( unsigned int portNumber, const std::string &portNam
   CFRelease( portNameRef );
 
   if ( result != noErr ) {
-    MIDIClientDispose( data->client );
     errorString_ = "MidiInCore::openPort: error creating OS-X MIDI input port.";
     error( RtMidiError::DRIVER_ERROR, errorString_ );
     return;
@@ -999,7 +1026,6 @@ void MidiInCore :: openPort( unsigned int portNumber, const std::string &portNam
   MIDIEndpointRef endpoint = MIDIGetSource( portNumber );
   if ( endpoint == 0 ) {
     MIDIPortDispose( port );
-    MIDIClientDispose( data->client );
     errorString_ = "MidiInCore::openPort: error getting MIDI input source reference.";
     error( RtMidiError::DRIVER_ERROR, errorString_ );
     return;
@@ -1009,7 +1035,6 @@ void MidiInCore :: openPort( unsigned int portNumber, const std::string &portNam
   result = MIDIPortConnectSource( port, endpoint, NULL );
   if ( result != noErr ) {
     MIDIPortDispose( port );
-    MIDIClientDispose( data->client );
     errorString_ = "MidiInCore::openPort: error connecting OS-X MIDI input port.";
     error( RtMidiError::DRIVER_ERROR, errorString_ );
     return;
@@ -1096,6 +1121,11 @@ CFStringRef EndpointName( MIDIEndpointRef endpoint, bool isExternal )
     CFStringAppend( result, str );
     CFRelease( str );
   }
+
+  // some MIDI devices have a leading space in endpoint name. trim
+  CFStringRef space = CFStringCreateWithCString(NULL, " ", kCFStringEncodingUTF8);
+  CFStringTrim(result, space);
+  CFRelease(space);
 
   MIDIEntityRef entity = 0;
   MIDIEndpointGetEntity( endpoint, &entity );
@@ -1252,31 +1282,43 @@ MidiOutCore :: ~MidiOutCore( void )
 
   // Cleanup.
   CoreMidiData *data = static_cast<CoreMidiData *> (apiData_);
-  MIDIClientDispose( data->client );
   if ( data->endpoint ) MIDIEndpointDispose( data->endpoint );
   delete data;
+}
+
+MIDIClientRef MidiOutCore::getCoreMidiClientSingleton(const std::string& clientName) throw() {
+
+  if (CoreMidiClientSingleton == 0){
+      // Set up our client.
+      MIDIClientRef client;
+
+      CFStringRef name = CFStringCreateWithCString( NULL, clientName.c_str(), kCFStringEncodingASCII );
+      OSStatus result = MIDIClientCreate(name, NULL, NULL, &client );
+      if ( result != noErr ) {
+        std::ostringstream ost;
+        ost << "MidiInCore::initialize: error creating OS-X MIDI client object (" << result << ").";
+        errorString_ = ost.str();
+        error( RtMidiError::DRIVER_ERROR, errorString_ );
+        return 0;
+      }
+      CFRelease( name );
+
+      CoreMidiClientSingleton = client;
+  }
+
+  return CoreMidiClientSingleton;
 }
 
 void MidiOutCore :: initialize( const std::string& clientName )
 {
   // Set up our client.
-  MIDIClientRef client;
-  CFStringRef name = CFStringCreateWithCString( NULL, clientName.c_str(), kCFStringEncodingASCII );
-  OSStatus result = MIDIClientCreate(name, NULL, NULL, &client );
-  if ( result != noErr ) {
-    std::ostringstream ost;
-    ost << "MidiInCore::initialize: error creating OS-X MIDI client object (" << result << ").";
-    errorString_ = ost.str();
-    error( RtMidiError::DRIVER_ERROR, errorString_ );
-    return;
-  }
+  MIDIClientRef client = getCoreMidiClientSingleton(clientName);
 
   // Save our api-specific connection information.
   CoreMidiData *data = (CoreMidiData *) new CoreMidiData;
   data->client = client;
   data->endpoint = 0;
   apiData_ = (void *) data;
-  CFRelease( name );
 }
 
 unsigned int MidiOutCore :: getPortCount()
@@ -1339,7 +1381,6 @@ void MidiOutCore :: openPort( unsigned int portNumber, const std::string &portNa
   OSStatus result = MIDIOutputPortCreate( data->client, portNameRef, &port );
   CFRelease( portNameRef );
   if ( result != noErr ) {
-    MIDIClientDispose( data->client );
     errorString_ = "MidiOutCore::openPort: error creating OS-X MIDI output port.";
     error( RtMidiError::DRIVER_ERROR, errorString_ );
     return;
@@ -1349,7 +1390,6 @@ void MidiOutCore :: openPort( unsigned int portNumber, const std::string &portNa
   MIDIEndpointRef destination = MIDIGetDestination( portNumber );
   if ( destination == 0 ) {
     MIDIPortDispose( port );
-    MIDIClientDispose( data->client );
     errorString_ = "MidiOutCore::openPort: error getting MIDI output destination reference.";
     error( RtMidiError::DRIVER_ERROR, errorString_ );
     return;
@@ -2978,6 +3018,7 @@ void MidiOutWinMM :: sendMessage( const unsigned char *message, size_t size )
 #include <jack/jack.h>
 #include <jack/midiport.h>
 #include <jack/ringbuffer.h>
+#include <pthread.h>
 #ifdef HAVE_SEMAPHORE
   #include <semaphore.h>
 #endif
@@ -2987,8 +3028,8 @@ void MidiOutWinMM :: sendMessage( const unsigned char *message, size_t size )
 struct JackMidiData {
   jack_client_t *client;
   jack_port_t *port;
-  jack_ringbuffer_t *buffSize;
-  jack_ringbuffer_t *buffMessage;
+  jack_ringbuffer_t *buff;
+  int buffMaxWrite; // actual writable size, usually 1 less than ringbuffer
   jack_time_t lastTime;
 #ifdef HAVE_SEMAPHORE
   sem_t sem_cleanup;
@@ -3268,11 +3309,15 @@ static int jackProcessOut( jack_nframes_t nframes, void *arg )
   void *buff = jack_port_get_buffer( data->port, nframes );
   jack_midi_clear_buffer( buff );
 
-  while ( jack_ringbuffer_read_space( data->buffSize ) > 0 ) {
-    jack_ringbuffer_read( data->buffSize, (char *) &space, (size_t) sizeof( space ) );
-    midiData = jack_midi_event_reserve( buff, 0, space );
+  while ( jack_ringbuffer_peek( data->buff, (char *) &space, sizeof( space ) ) == sizeof(space) &&
+          jack_ringbuffer_read_space( data->buff ) >= sizeof(space) + space ) {
+    jack_ringbuffer_read_advance( data->buff, sizeof(space) );
 
-    jack_ringbuffer_read( data->buffMessage, (char *) midiData, (size_t) space );
+    midiData = jack_midi_event_reserve( buff, 0, space );
+    if ( midiData )
+        jack_ringbuffer_read( data->buff, (char *) midiData, (size_t) space );
+    else
+        jack_ringbuffer_read_advance( data->buff, (size_t) space );
   }
 
 #ifdef HAVE_SEMAPHORE
@@ -3311,8 +3356,8 @@ void MidiOutJack :: connect()
     return;
 
   // Initialize output ringbuffers
-  data->buffSize = jack_ringbuffer_create( JACK_RINGBUFFER_SIZE );
-  data->buffMessage = jack_ringbuffer_create( JACK_RINGBUFFER_SIZE );
+  data->buff = jack_ringbuffer_create( JACK_RINGBUFFER_SIZE );
+  data->buffMaxWrite = (int) jack_ringbuffer_write_space( data->buff );
 
   // Initialize JACK client
   if ( ( data->client = jack_client_open( clientName.c_str(), JackNoStartServer, NULL ) ) == 0 ) {
@@ -3331,8 +3376,7 @@ MidiOutJack :: ~MidiOutJack()
   MidiOutJack::closePort();
 
   // Cleanup
-  jack_ringbuffer_free( data->buffSize );
-  jack_ringbuffer_free( data->buffMessage );
+  jack_ringbuffer_free( data->buff );
   if ( data->client ) {
     jack_client_close( data->client );
   }
@@ -3479,9 +3523,15 @@ void MidiOutJack :: sendMessage( const unsigned char *message, size_t size )
   int nBytes = static_cast<int>(size);
   JackMidiData *data = static_cast<JackMidiData *> (apiData_);
 
+  if ( size + sizeof(nBytes) > (size_t) data->buffMaxWrite )
+      return;
+
+  while ( jack_ringbuffer_write_space(data->buff) < sizeof(nBytes) + size )
+      pthread_yield();
+
   // Write full message to buffer
-  jack_ringbuffer_write( data->buffMessage, ( const char * ) message, nBytes );
-  jack_ringbuffer_write( data->buffSize, ( char * ) &nBytes, sizeof( nBytes ) );
+  jack_ringbuffer_write( data->buff, ( char * ) &nBytes, sizeof( nBytes ) );
+  jack_ringbuffer_write( data->buff, ( const char * ) message, nBytes );
 }
 
 #endif  // __UNIX_JACK__
