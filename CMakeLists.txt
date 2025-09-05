@@ -200,7 +200,7 @@ target_include_directories(rtmidi PRIVATE ${INCDIRS}
 
 # Set compile-time definitions
 target_compile_definitions(rtmidi PRIVATE ${API_DEFS})
-target_compile_definitions(rtmidi PRIVATE RTMIDI_EXPORT)
+# target_compile_definitions(rtmidi PRIVATE RTMIDI_EXPORT)
 target_link_libraries(rtmidi PUBLIC ${PUBLICLINKLIBS} 
                              PRIVATE ${LINKLIBS})
 

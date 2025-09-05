@@ -230,6 +230,7 @@ class MidiInWinMM: public MidiInApi
 
  protected:
   void initialize( const std::string& clientName );
+  void cleanupSysexThread();
 };
 
 class MidiOutWinMM: public MidiOutApi
@@ -2480,6 +2481,9 @@ struct WinMidiData {
   MidiInApi::MidiMessage message;
   LPMIDIHDR sysexBuffer[RT_SYSEX_BUFFER_COUNT];
   CRITICAL_SECTION _mutex; // [Patrice] see https://groups.google.com/forum/#!topic/mididev/6OUjHutMpEo
+  HANDLE hBufferReadyEvent; // signals that a sysex buffer is ready
+  HANDLE hKillBufferThread; // signals that we should stop processing sysex buffers
+  HANDLE hSysexThread;
 };
 
 //*********************************************************************//
@@ -2506,64 +2510,48 @@ static void CALLBACK midiInputCallback( HMIDIIN /*hmin*/,
   }
   else apiData->message.timeStamp = (double) ( timestamp - apiData->lastTime ) * 0.001;
 
-  if ( inputStatus == MIM_DATA ) { // Channel or system message
+  if (inputStatus == MIM_DATA)
+  { // Channel or system message
 
-    // Make sure the first byte is a status byte.
-    unsigned char status = (unsigned char) (midiMessage & 0x000000FF);
-    if ( !(status & 0x80) ) return;
+// Make sure the first byte is a status byte.
+      unsigned char status = (unsigned char)(midiMessage & 0x000000FF);
+      if (!(status & 0x80)) return;
 
-    // Determine the number of bytes in the MIDI message.
-    unsigned short nBytes = 1;
-    if ( status < 0xC0 ) nBytes = 3;
-    else if ( status < 0xE0 ) nBytes = 2;
-    else if ( status < 0xF0 ) nBytes = 3;
-    else if ( status == 0xF1 ) {
-      if ( data->ignoreFlags & 0x02 ) return;
-      else nBytes = 2;
-    }
-    else if ( status == 0xF2 ) nBytes = 3;
-    else if ( status == 0xF3 ) nBytes = 2;
-    else if ( status == 0xF8 && ( data->ignoreFlags & 0x02 ) ) {
-      // A MIDI timing tick message and we're ignoring it.
-      return;
-    }
-    else if ( status == 0xFE && ( data->ignoreFlags & 0x04 ) ) {
-      // A MIDI active sensing message and we're ignoring it.
-      return;
-    }
+      // Determine the number of bytes in the MIDI message.
+      unsigned short nBytes = 1;
+      if (status < 0xC0) nBytes = 3;
+      else if (status < 0xE0) nBytes = 2;
+      else if (status < 0xF0) nBytes = 3;
+      else if (status == 0xF1)
+      {
+          if (data->ignoreFlags & 0x02) return;
+          else nBytes = 2;
+      }
+      else if (status == 0xF2) nBytes = 3;
+      else if (status == 0xF3) nBytes = 2;
+      else if (status == 0xF8 && (data->ignoreFlags & 0x02))
+      {
+          // A MIDI timing tick message and we're ignoring it.
+          return;
+      }
+      else if (status == 0xFE && (data->ignoreFlags & 0x04))
+      {
+          // A MIDI active sensing message and we're ignoring it.
+          return;
+      }
 
-    // Copy bytes to our MIDI message.
-    unsigned char *ptr = (unsigned char *) &midiMessage;
-    for ( int i=0; i<nBytes; ++i ) apiData->message.bytes.push_back( *ptr++ );
+      // Copy bytes to our MIDI message.
+      unsigned char* ptr = (unsigned char*)&midiMessage;
+      for (int i = 0; i < nBytes; ++i) apiData->message.bytes.push_back(*ptr++);
   }
-  else { // Sysex message ( MIM_LONGDATA or MIM_LONGERROR )
-    MIDIHDR *sysex = ( MIDIHDR *) midiMessage;
-    if ( !( data->ignoreFlags & 0x01 ) && inputStatus != MIM_LONGERROR ) {
-      // Sysex message and we're not ignoring it
-      for ( int i=0; i<(int)sysex->dwBytesRecorded; ++i )
-        apiData->message.bytes.push_back( sysex->lpData[i] );
-    }
-
-    // The WinMM API requires that the sysex buffer be requeued after
-    // input of each sysex message.  Even if we are ignoring sysex
-    // messages, we still need to requeue the buffer in case the user
-    // decides to not ignore sysex messages in the future.  However,
-    // it seems that WinMM calls this function with an empty sysex
-    // buffer when an application closes and in this case, we should
-    // avoid requeueing it, else the computer suddenly reboots after
-    // one or two minutes.
-    if ( apiData->sysexBuffer[sysex->dwUser]->dwBytesRecorded > 0 ) {
-      //if ( sysex->dwBytesRecorded > 0 ) {
-      EnterCriticalSection( &(apiData->_mutex) );
-      MMRESULT result = midiInAddBuffer( apiData->inHandle, apiData->sysexBuffer[sysex->dwUser], sizeof(MIDIHDR) );
-      LeaveCriticalSection( &(apiData->_mutex) );
-      if ( result != MMSYSERR_NOERROR )
-        std::cerr << "\nRtMidiIn::midiInputCallback: error sending sysex to Midi device!!\n\n";
-
-      if ( data->ignoreFlags & 0x01 ) return;
-    }
-    else return;
+  else if (inputStatus == MIM_LONGDATA)
+  {
+      // Sysex message
+      SetEvent(apiData->hBufferReadyEvent);
+      return;
   }
+  else if (inputStatus == MIM_LONGERROR)
+      return;
 
   // Save the time of the last non-filtered message
   apiData->lastTime = timestamp;
@@ -2580,6 +2568,62 @@ static void CALLBACK midiInputCallback( HMIDIIN /*hmin*/,
 
   // Clear the vector for the next input message.
   apiData->message.bytes.clear();
+}
+
+static DWORD WINAPI sysexBufferThread(LPVOID lpParam)
+{
+    MidiInApi::RtMidiInData* data = (MidiInApi::RtMidiInData*)lpParam;
+    WinMidiData* apiData = static_cast<WinMidiData*> (data->apiData);
+
+    HANDLE events[] = { apiData->hBufferReadyEvent, apiData->hKillBufferThread };
+
+    MidiInApi::MidiMessage midiMessage;
+
+    while (true)
+    {
+        DWORD result = WaitForMultipleObjects(2, events, FALSE, INFINITE);
+
+        if (result == WAIT_OBJECT_0)
+        {
+            ResetEvent(apiData->hBufferReadyEvent);
+
+            for (int i = 0; i < 4; i++)
+            {
+                auto* lphdr = apiData->sysexBuffer[i];
+                if (lphdr->dwFlags & MHDR_DONE)
+                {
+                    if (!(data->ignoreFlags & 0x01))
+                    {
+                        // Sysex message and we're not ignoring it
+                        for (int i = 0; i < (int)lphdr->dwBytesRecorded; ++i)
+                            midiMessage.bytes.push_back(lphdr->lpData[i]);
+
+                        if (data->usingCallback)
+                        {
+                            RtMidiIn::RtMidiCallback callback = (RtMidiIn::RtMidiCallback)data->userCallback;
+                            callback(midiMessage.timeStamp, &midiMessage.bytes, data->userData);
+                        }
+
+                        midiMessage.bytes.clear();
+                    }
+
+                    EnterCriticalSection(&(apiData->_mutex));
+                    // Unprepare the header before re-using it.
+                    midiInUnprepareHeader(apiData->inHandle, lphdr, sizeof(MIDIHDR));
+                    // Prepare the header for re-use.
+                    midiInPrepareHeader(apiData->inHandle, lphdr, sizeof(MIDIHDR));
+                    // Re-queue the buffer.
+                    midiInAddBuffer(apiData->inHandle, lphdr, sizeof(MIDIHDR));
+
+                    LeaveCriticalSection(&(apiData->_mutex));
+                }
+            }
+        }
+        else if (result == WAIT_OBJECT_0 + 1)
+            break;
+    }
+
+    return 0;
 }
 
 MidiInWinMM :: MidiInWinMM( const std::string &clientName, unsigned int queueSizeLimit )
@@ -2620,6 +2664,18 @@ void MidiInWinMM :: initialize( const std::string& /*clientName*/ )
     errorString_ = "MidiInWinMM::initialize: InitializeCriticalSectionAndSpinCount failed.";
     error( RtMidiError::WARNING, errorString_ );
   }
+}
+
+void MidiInWinMM::cleanupSysexThread()
+{
+    WinMidiData* data = static_cast<WinMidiData*> (apiData_);
+
+    SetEvent(data->hKillBufferThread);
+    WaitForSingleObject(data->hSysexThread, INFINITE);
+
+    CloseHandle(data->hKillBufferThread);
+    CloseHandle(data->hBufferReadyEvent);
+    CloseHandle(data->hSysexThread);
 }
 
 void MidiInWinMM :: openPort( unsigned int portNumber, const std::string &/*portName*/ )
@@ -2685,9 +2741,17 @@ void MidiInWinMM :: openPort( unsigned int portNumber, const std::string &/*port
     }
   }
 
+  data->hBufferReadyEvent = CreateEvent(NULL, TRUE, FALSE, NULL);
+  data->hKillBufferThread = CreateEvent(NULL, TRUE, FALSE, NULL);
+
+  data->hSysexThread = CreateThread(NULL, 0, sysexBufferThread, &inputData_, 0, NULL);
+
   result = midiInStart( data->inHandle );
   if ( result != MMSYSERR_NOERROR ) {
-    midiInClose( data->inHandle );
+    cleanupSysexThread();
+
+    midiInClose(data->inHandle);
+    
     data->inHandle = 0;
     errorString_ = "MidiInWinMM::openPort: error starting Windows MM MIDI input port.";
     error( RtMidiError::DRIVER_ERROR, errorString_ );
@@ -2717,13 +2781,19 @@ void MidiInWinMM :: closePort( void )
       delete [] data->sysexBuffer[i]->lpData;
       delete [] data->sysexBuffer[i];
       if ( result != MMSYSERR_NOERROR ) {
+        cleanupSysexThread();
         midiInClose( data->inHandle );
         data->inHandle = 0;
         errorString_ = "MidiInWinMM::openPort: error closing Windows MM MIDI input port (midiInUnprepareHeader).";
         error( RtMidiError::DRIVER_ERROR, errorString_ );
+        LeaveCriticalSection(&(data->_mutex));
         return;
       }
     }
+
+    LeaveCriticalSection(&(data->_mutex));
+    cleanupSysexThread();
+    EnterCriticalSection(&(data->_mutex));
 
     midiInClose( data->inHandle );
     data->inHandle = 0;
